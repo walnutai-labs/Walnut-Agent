@@ -1,0 +1,94 @@
+name: Release
+
+# ---------------------------------------------------------------------------
+# Walnut Agent release pipeline.
+#
+# IMPORTANT: this workflow must live in the GitHub repo (walnutai-labs/Walnut-Agent).
+# The source of truth is self-hosted GitLab; the runner clones it at build time,
+# so nothing is committed to GitHub except the release + docs + this file.
+#
+# Trigger: Actions -> Release -> Run workflow -> enter the tag (already pushed to
+# GitLab), e.g. v0.5.0 (prod) or v0.5.0-qa.1 / v0.5.0-dev.3 (pre-release / internal).
+# Tags with a "-suffix" are published as GitHub pre-releases, so the prod
+# auto-updater (which reads /releases/latest) never sees them.
+#
+# Windows job only for now. macOS (arm64 + x64) jobs will be added next.
+# ---------------------------------------------------------------------------
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Git tag to build (must already exist in GitLab). e.g. v0.5.0 or v0.5.0-qa.1"
+        required: true
+
+# Needed for gh release create/upload with the default GITHUB_TOKEN
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - name: Clone source from GitLab at tag
+        shell: bash
+        env:
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+        run: |
+          git clone --depth 1 --branch "${{ github.event.inputs.tag }}" \
+            "https://oauth2:${GITLAB_TOKEN}@gitlab.devopsark.com/walnut/walnut-agent.git" src
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Set package version from tag
+        shell: bash
+        working-directory: src
+        run: |
+          VER="${{ github.event.inputs.tag }}"
+          VER="${VER#v}"                       # strip leading v
+          npm version "$VER" --no-git-tag-version --allow-same-version
+
+      # Playwright browsers are ~1 GB and rarely change (pinned in package.json).
+      # Cache keyed on package.json so a Playwright bump busts it automatically.
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: src/playwright-browsers/win64
+          key: pw-win64-${{ hashFiles('src/package.json') }}
+
+      - name: Install dependencies
+        shell: bash
+        working-directory: src
+        run: npm install         # NOTE: package-lock.json is not tracked, so npm ci is not usable
+
+      - name: Build + package (signed)
+        shell: bash
+        working-directory: src
+        env:
+          CSC_LINK: ${{ secrets.WIN_CSC_LINK }}                 # base64 of codesign.pfx
+          CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
+        run: npm run build:win64:ci
+
+      - name: Publish to GitHub Release
+        shell: bash
+        working-directory: src
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          # Pre-release for any tag with a -suffix (e.g. -qa.1, -dev.3)
+          PRERELEASE=""
+          case "$TAG" in *-*) PRERELEASE="--prerelease" ;; esac
+          # Create the release if it does not exist yet (Windows may run before/after mac)
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --title "$TAG" --notes "Automated build for $TAG" $PRERELEASE
+          fi
+          # Upload Windows artifacts (installer + zip used by the auto-updater)
+          gh release upload "$TAG" \
+            "release/Walnut Agent Setup"*.exe \
+            release/*-win-*.zip \
+            --clobber
