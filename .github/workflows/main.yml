@@ -166,7 +166,8 @@ jobs:
 
   macos-x64:
     needs: create-release
-    runs-on: macos-13        # Intel — native x64 build
+    runs-on: macos-15-intel  # Intel — native x64 build (macos-13 was retired Dec 2025;
+                             # macos-15-intel is the last Intel image, available until Aug 2027)
     steps:
       - name: Clone source from GitLab at tag
         env:
