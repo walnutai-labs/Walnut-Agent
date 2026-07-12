@@ -4,7 +4,7 @@ name: Release
 # Walnut Agent release pipeline.
 #
 # IMPORTANT: this workflow must live in the GitHub repo (walnutai-labs/Walnut-Agent).
-# The source of truth is self-hosted GitLab; the runner clones it at build time,
+# The source of truth is self-hosted GitLab; each runner clones it at build time,
 # so nothing is committed to GitHub except the release + docs + this file.
 #
 # Trigger: Actions -> Release -> Run workflow -> enter the tag (already pushed to
@@ -12,7 +12,10 @@ name: Release
 # Tags with a "-suffix" are published as GitHub pre-releases, so the prod
 # auto-updater (which reads /releases/latest) never sees them.
 #
-# Windows job only for now. macOS (arm64 + x64) jobs will be added next.
+# Jobs run in parallel after create-release:
+#   windows      -> windows-latest  (NSIS installer + zip, signed)
+#   macos-arm64  -> macos-14 (Apple Silicon, native)  DMG + zip, signed + notarized
+#   macos-x64    -> macos-13 (Intel, native)          DMG + zip, signed + notarized
 # ---------------------------------------------------------------------------
 
 on:
@@ -27,7 +30,28 @@ permissions:
   contents: write
 
 jobs:
+  # Create the release once, up front, so the parallel build jobs only upload
+  # (avoids a race where multiple jobs try to create the same release).
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ensure the GitHub Release exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          PRERELEASE=""
+          case "$TAG" in *-*) PRERELEASE="--prerelease" ;; esac
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            # --target main: anchor the tag to the GitHub repo's main (the source
+            # commit lives in GitLab, so gh can't use it). The commit is just a
+            # label; the auto-updater only reads the tag name + assets.
+            gh release create "$TAG" --target main --title "$TAG" --notes "Automated build for $TAG" $PRERELEASE
+          fi
+
   windows:
+    needs: create-release
     runs-on: windows-latest
     steps:
       - name: Clone source from GitLab at tag
@@ -47,12 +71,9 @@ jobs:
         shell: bash
         working-directory: src
         run: |
-          VER="${{ github.event.inputs.tag }}"
-          VER="${VER#v}"                       # strip leading v
+          VER="${{ github.event.inputs.tag }}"; VER="${VER#v}"
           npm version "$VER" --no-git-tag-version --allow-same-version
 
-      # Playwright browsers are ~1 GB and rarely change (pinned in package.json).
-      # Cache keyed on package.json so a Playwright bump busts it automatically.
       - name: Cache Playwright browsers
         uses: actions/cache@v4
         with:
@@ -62,33 +83,130 @@ jobs:
       - name: Install dependencies
         shell: bash
         working-directory: src
-        run: npm install         # NOTE: package-lock.json is not tracked, so npm ci is not usable
+        run: npm install         # package-lock.json is not tracked, so npm ci is not usable
 
       - name: Build + package (signed)
         shell: bash
         working-directory: src
         env:
-          CSC_LINK: ${{ secrets.WIN_CSC_LINK }}                 # base64 of codesign.pfx
+          CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
           CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
         run: npm run build:win64:ci
 
-      - name: Publish to GitHub Release
+      - name: Upload Windows artifacts
         shell: bash
         working-directory: src
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
         run: |
-          TAG="${{ github.event.inputs.tag }}"
-          # Pre-release for any tag with a -suffix (e.g. -qa.1, -dev.3)
-          PRERELEASE=""
-          case "$TAG" in *-*) PRERELEASE="--prerelease" ;; esac
-          # Create the release if it does not exist yet (Windows may run before/after mac)
-          if ! gh release view "$TAG" >/dev/null 2>&1; then
-            gh release create "$TAG" --title "$TAG" --notes "Automated build for $TAG" $PRERELEASE
-          fi
-          # Upload Windows artifacts (installer + zip used by the auto-updater)
-          gh release upload "$TAG" \
+          gh release upload "${{ github.event.inputs.tag }}" \
             "release/Walnut Agent Setup"*.exe \
-            release/*-win-*.zip \
+            release/*-win.zip \
+            --clobber
+
+  macos-arm64:
+    needs: create-release
+    runs-on: macos-14        # Apple Silicon — native arm64 build
+    steps:
+      - name: Clone source from GitLab at tag
+        env:
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+        run: |
+          git clone --depth 1 --branch "${{ github.event.inputs.tag }}" \
+            "https://oauth2:${GITLAB_TOKEN}@gitlab.devopsark.com/walnut/walnut-agent.git" src
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Set package version from tag
+        working-directory: src
+        run: |
+          VER="${{ github.event.inputs.tag }}"; VER="${VER#v}"
+          npm version "$VER" --no-git-tag-version --allow-same-version
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: src/playwright-browsers/macarm64
+          key: pw-macarm64-${{ hashFiles('src/package.json') }}
+
+      - name: Install dependencies
+        working-directory: src
+        run: npm install
+
+      - name: Build + package (signed + notarized)
+        working-directory: src
+        env:
+          CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: npm run build:dmg-arm64:ci
+
+      - name: Upload macOS arm64 artifacts
+        working-directory: src
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release upload "${{ github.event.inputs.tag }}" \
+            release/*-mac-arm64.dmg \
+            release/*-mac-arm64.zip \
+            --clobber
+
+  macos-x64:
+    needs: create-release
+    runs-on: macos-13        # Intel — native x64 build
+    steps:
+      - name: Clone source from GitLab at tag
+        env:
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+        run: |
+          git clone --depth 1 --branch "${{ github.event.inputs.tag }}" \
+            "https://oauth2:${GITLAB_TOKEN}@gitlab.devopsark.com/walnut/walnut-agent.git" src
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Set package version from tag
+        working-directory: src
+        run: |
+          VER="${{ github.event.inputs.tag }}"; VER="${VER#v}"
+          npm version "$VER" --no-git-tag-version --allow-same-version
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: src/playwright-browsers/macx64
+          key: pw-macx64-${{ hashFiles('src/package.json') }}
+
+      - name: Install dependencies
+        working-directory: src
+        run: npm install
+
+      - name: Build + package (signed + notarized)
+        working-directory: src
+        env:
+          CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: npm run build:dmg-x64:ci
+
+      - name: Upload macOS x64 artifacts
+        working-directory: src
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release upload "${{ github.event.inputs.tag }}" \
+            release/*-mac-x64.dmg \
+            release/*-mac-x64.zip \
             --clobber
