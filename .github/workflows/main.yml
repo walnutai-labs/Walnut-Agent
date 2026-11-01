@@ -165,13 +165,49 @@ jobs:
           APP="$(find release -maxdepth 2 -name '*.app' -type d | head -1)"
           echo "App: $APP"
           [ -n "$APP" ] || { echo "No .app found under release/"; exit 0; }
-          echo "--- codesign verify ---"
-          codesign --verify --deep --strict --verbose=4 "$APP" 2>&1 | tail -40 || true
-          echo "--- xattrs (excluding code-signature attrs) ---"
-          xattr -lr "$APP" 2>/dev/null | grep -v com.apple.cs | head -40 || true
-          echo "--- WebKit framework layout ---"
-          FW="$(find "$APP/Contents/Resources/playwright-browsers" -maxdepth 3 -name 'WebKit.framework' -type d | head -1)"
-          [ -n "$FW" ] && ls -la "$FW" "$FW/Versions" || echo "WebKit.framework not found"
+          BROWSERS="$APP/Contents/Resources/playwright-browsers"
+          MAIN="$APP/Contents/MacOS/$(basename "$APP" .app)"
+          WEBKIT="$(find "$BROWSERS" -maxdepth 3 -name 'WebKit.framework' -type d | head -1)"
+
+          echo "=== 1. Signature xattrs (com.apple.cs.*) — which files carry them ==="
+          xattr -lr "$APP" 2>/dev/null | grep 'com.apple.cs\.' | cut -d: -f1 | sort -u | head -40 || true
+          echo "=== 1b. All xattr names present anywhere in the bundle ==="
+          xattr -lr "$APP" 2>/dev/null | awk -F': ' '{print $2}' | sort | uniq -c | sort -rn | head || true
+
+          echo "=== 2. Main executable: who signed it, and strict verify ==="
+          codesign -dvv "$MAIN" 2>&1 | grep -E 'Identifier|Authority|TeamIdentifier|flags|Sealed Resources|Internal requirements' || true
+          codesign --verify --strict --verbose=2 "$MAIN" 2>&1 || true
+
+          echo "=== 3. WebKit.framework: who signed it, and strict verify ==="
+          if [ -n "$WEBKIT" ]; then
+            codesign -dvv "$WEBKIT" 2>&1 | grep -E 'Identifier|Authority|TeamIdentifier|flags|Sealed Resources' || true
+            codesign --verify --strict --verbose=2 "$WEBKIT" 2>&1 || true
+            codesign --verify --strict --verbose=2 "$WEBKIT/Versions/A/WebKit" 2>&1 || true
+          fi
+
+          echo "=== 4. Chrome helper app (one of the __MACOSX entries) ==="
+          HELPER="$(find "$BROWSERS" -name 'Google Chrome for Testing Helper (Alerts).app' -type d | head -1)"
+          if [ -n "$HELPER" ]; then
+            xattr -l "$HELPER" 2>/dev/null || true
+            codesign -dvv "$HELPER" 2>&1 | grep -E 'Authority|flags' || true
+            codesign --verify --strict --verbose=2 "$HELPER" 2>&1 || true
+          fi
+
+          echo "=== 5. Round-trip through the same zip the notary receives ==="
+          RT="$RUNNER_TEMP/rt"; rm -rf "$RT"; mkdir -p "$RT"
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "$RT/app.zip"
+          echo "-- __MACOSX / ._ entries in zip:"
+          unzip -l "$RT/app.zip" | grep -cE '__MACOSX|/\._' || true
+          ditto -x -k "$RT/app.zip" "$RT/out"
+          RTAPP="$RT/out/$(basename "$APP")"
+          echo "-- main exe after round-trip:"
+          codesign --verify --strict --verbose=2 "$RTAPP/Contents/MacOS/$(basename "$APP" .app)" 2>&1 || true
+          echo "-- WebKit after round-trip:"
+          RTWK="$(find "$RTAPP/Contents/Resources/playwright-browsers" -maxdepth 3 -name 'WebKit.framework' -type d | head -1)"
+          [ -n "$RTWK" ] && codesign --verify --strict --verbose=2 "$RTWK/Versions/A/WebKit" 2>&1 || true
+          echo "-- whole app after round-trip:"
+          codesign --verify --deep --strict --verbose=2 "$RTAPP" 2>&1 | tail -5 || true
+
 
       - name: Upload macOS arm64 artifacts
         working-directory: src
@@ -242,13 +278,49 @@ jobs:
           APP="$(find release -maxdepth 2 -name '*.app' -type d | head -1)"
           echo "App: $APP"
           [ -n "$APP" ] || { echo "No .app found under release/"; exit 0; }
-          echo "--- codesign verify ---"
-          codesign --verify --deep --strict --verbose=4 "$APP" 2>&1 | tail -40 || true
-          echo "--- xattrs (excluding code-signature attrs) ---"
-          xattr -lr "$APP" 2>/dev/null | grep -v com.apple.cs | head -40 || true
-          echo "--- WebKit framework layout ---"
-          FW="$(find "$APP/Contents/Resources/playwright-browsers" -maxdepth 3 -name 'WebKit.framework' -type d | head -1)"
-          [ -n "$FW" ] && ls -la "$FW" "$FW/Versions" || echo "WebKit.framework not found"
+          BROWSERS="$APP/Contents/Resources/playwright-browsers"
+          MAIN="$APP/Contents/MacOS/$(basename "$APP" .app)"
+          WEBKIT="$(find "$BROWSERS" -maxdepth 3 -name 'WebKit.framework' -type d | head -1)"
+
+          echo "=== 1. Signature xattrs (com.apple.cs.*) — which files carry them ==="
+          xattr -lr "$APP" 2>/dev/null | grep 'com.apple.cs\.' | cut -d: -f1 | sort -u | head -40 || true
+          echo "=== 1b. All xattr names present anywhere in the bundle ==="
+          xattr -lr "$APP" 2>/dev/null | awk -F': ' '{print $2}' | sort | uniq -c | sort -rn | head || true
+
+          echo "=== 2. Main executable: who signed it, and strict verify ==="
+          codesign -dvv "$MAIN" 2>&1 | grep -E 'Identifier|Authority|TeamIdentifier|flags|Sealed Resources|Internal requirements' || true
+          codesign --verify --strict --verbose=2 "$MAIN" 2>&1 || true
+
+          echo "=== 3. WebKit.framework: who signed it, and strict verify ==="
+          if [ -n "$WEBKIT" ]; then
+            codesign -dvv "$WEBKIT" 2>&1 | grep -E 'Identifier|Authority|TeamIdentifier|flags|Sealed Resources' || true
+            codesign --verify --strict --verbose=2 "$WEBKIT" 2>&1 || true
+            codesign --verify --strict --verbose=2 "$WEBKIT/Versions/A/WebKit" 2>&1 || true
+          fi
+
+          echo "=== 4. Chrome helper app (one of the __MACOSX entries) ==="
+          HELPER="$(find "$BROWSERS" -name 'Google Chrome for Testing Helper (Alerts).app' -type d | head -1)"
+          if [ -n "$HELPER" ]; then
+            xattr -l "$HELPER" 2>/dev/null || true
+            codesign -dvv "$HELPER" 2>&1 | grep -E 'Authority|flags' || true
+            codesign --verify --strict --verbose=2 "$HELPER" 2>&1 || true
+          fi
+
+          echo "=== 5. Round-trip through the same zip the notary receives ==="
+          RT="$RUNNER_TEMP/rt"; rm -rf "$RT"; mkdir -p "$RT"
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "$RT/app.zip"
+          echo "-- __MACOSX / ._ entries in zip:"
+          unzip -l "$RT/app.zip" | grep -cE '__MACOSX|/\._' || true
+          ditto -x -k "$RT/app.zip" "$RT/out"
+          RTAPP="$RT/out/$(basename "$APP")"
+          echo "-- main exe after round-trip:"
+          codesign --verify --strict --verbose=2 "$RTAPP/Contents/MacOS/$(basename "$APP" .app)" 2>&1 || true
+          echo "-- WebKit after round-trip:"
+          RTWK="$(find "$RTAPP/Contents/Resources/playwright-browsers" -maxdepth 3 -name 'WebKit.framework' -type d | head -1)"
+          [ -n "$RTWK" ] && codesign --verify --strict --verbose=2 "$RTWK/Versions/A/WebKit" 2>&1 || true
+          echo "-- whole app after round-trip:"
+          codesign --verify --deep --strict --verbose=2 "$RTAPP" 2>&1 | tail -5 || true
+
 
       - name: Upload macOS x64 artifacts
         working-directory: src
