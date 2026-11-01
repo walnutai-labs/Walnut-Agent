@@ -14,8 +14,8 @@ name: Release
 #
 # Jobs run in parallel after create-release:
 #   windows      -> windows-latest  (NSIS installer + zip, signed)
-#   macos-arm64  -> macos-14 (Apple Silicon, native)  DMG + zip, signed + notarized
-#   macos-x64    -> macos-13 (Intel, native)          DMG + zip, signed + notarized
+#   macos-arm64  -> macos-15        (Apple Silicon, native)  DMG + zip, signed + notarized
+#   macos-x64    -> macos-15-intel  (Intel, native)          DMG + zip, signed + notarized
 # ---------------------------------------------------------------------------
 
 on:
@@ -107,7 +107,7 @@ jobs:
 
   macos-arm64:
     needs: create-release
-    runs-on: macos-15        # Apple Silicon — native arm64 build
+    runs-on: macos-15        # Apple Silicon — native arm64 build (macos-14 retired Nov 2, 2026)
     steps:
       - name: Clone source from GitLab at tag
         env:
@@ -131,7 +131,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: src/playwright-browsers/macarm64
-          key: pw-macarm64-${{ hashFiles('src/package.json') }}
+          # Image name in the key so browsers cached on macos-14 are not reused
+          key: pw-macarm64-macos15-${{ hashFiles('src/package.json') }}
 
       - name: Install dependencies
         working-directory: src
@@ -146,12 +147,31 @@ jobs:
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
+          # Strip extended attributes (quarantine/provenance/FinderInfo) from the
+          # bundled browsers before signing; they cause "signature invalid" at
+          # notarization and the __MACOSX entries in the notary zip.
+          xattr -cr playwright-browsers || true
           # Bundled Playwright browsers (WebKit/Chromium/Firefox) contain tens of
           # thousands of files; raise the macOS open-file limit so electron-builder
           # does not hit EMFILE while signing/copying them.
           sudo launchctl limit maxfiles 65536 200000
           ulimit -n 65536
           npm run build:dmg-arm64:ci
+
+      - name: Diagnose signature
+        if: failure()
+        working-directory: src
+        run: |
+          APP="$(find release -maxdepth 2 -name '*.app' -type d | head -1)"
+          echo "App: $APP"
+          [ -n "$APP" ] || { echo "No .app found under release/"; exit 0; }
+          echo "--- codesign verify ---"
+          codesign --verify --deep --strict --verbose=4 "$APP" 2>&1 | tail -40 || true
+          echo "--- xattrs (excluding code-signature attrs) ---"
+          xattr -lr "$APP" 2>/dev/null | grep -v com.apple.cs | head -40 || true
+          echo "--- WebKit framework layout ---"
+          FW="$(find "$APP/Contents/Resources/playwright-browsers" -maxdepth 3 -name 'WebKit.framework' -type d | head -1)"
+          [ -n "$FW" ] && ls -la "$FW" "$FW/Versions" || echo "WebKit.framework not found"
 
       - name: Upload macOS arm64 artifacts
         working-directory: src
@@ -191,7 +211,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: src/playwright-browsers/macx64
-          key: pw-macx64-${{ hashFiles('src/package.json') }}
+          key: pw-macx64-macos15-${{ hashFiles('src/package.json') }}
 
       - name: Install dependencies
         working-directory: src
@@ -206,12 +226,29 @@ jobs:
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
+          # Strip extended attributes from the bundled browsers before signing.
+          xattr -cr playwright-browsers || true
           # Bundled Playwright browsers (WebKit/Chromium/Firefox) contain tens of
           # thousands of files; raise the macOS open-file limit so electron-builder
           # does not hit EMFILE while signing/copying them.
           sudo launchctl limit maxfiles 65536 200000
           ulimit -n 65536
           npm run build:dmg-x64:ci
+
+      - name: Diagnose signature
+        if: failure()
+        working-directory: src
+        run: |
+          APP="$(find release -maxdepth 2 -name '*.app' -type d | head -1)"
+          echo "App: $APP"
+          [ -n "$APP" ] || { echo "No .app found under release/"; exit 0; }
+          echo "--- codesign verify ---"
+          codesign --verify --deep --strict --verbose=4 "$APP" 2>&1 | tail -40 || true
+          echo "--- xattrs (excluding code-signature attrs) ---"
+          xattr -lr "$APP" 2>/dev/null | grep -v com.apple.cs | head -40 || true
+          echo "--- WebKit framework layout ---"
+          FW="$(find "$APP/Contents/Resources/playwright-browsers" -maxdepth 3 -name 'WebKit.framework' -type d | head -1)"
+          [ -n "$FW" ] && ls -la "$FW" "$FW/Versions" || echo "WebKit.framework not found"
 
       - name: Upload macOS x64 artifacts
         working-directory: src
