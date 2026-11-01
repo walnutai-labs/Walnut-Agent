@@ -138,6 +138,134 @@ jobs:
         working-directory: src
         run: npm install
 
+      - name: Write notarize hook (repairs Playwright WebKit signing, then notarizes)
+        working-directory: src
+        run: |
+          mkdir -p build
+          cat > build/notarize.js <<'NOTARIZE_EOF'
+          // build/notarize.js — electron-builder afterSign hook.
+          //
+          // Repairs two defects in the bundled Playwright WebKit that make Apple's
+          // notary reject the app on current macOS toolchains (confirmed via
+          // `codesign --verify --strict` on the built app):
+          //
+          //   1. Playwright ships a real file named `._metadata.json` inside
+          //      WebKit.framework. electron-builder seals it into the app; `ditto` then
+          //      treats it as an AppleDouble sidecar and drops it from the zip, so the
+          //      main executable's resource seal fails at Apple.
+          //   2. electron-builder signs WebKit.framework before the XPC services inside
+          //      it, so the framework's seal is invalid ("file modified ... .xpc").
+          //
+          // Fix: delete `._*` files, re-sign the WebKit frameworks inside-out (XPC
+          // services first), re-sign the outer app (no --deep) so its seal is fresh,
+          // strip extended attributes, verify through a ditto round-trip, then notarize.
+          // Requires `"notarize": false` under build.mac and
+          // `"afterSign": "build/notarize.js"` under build.
+          const { execFileSync } = require("child_process");
+          const fs = require("fs");
+          const os = require("os");
+          const path = require("path");
+          const { notarize } = require("@electron/notarize");
+
+          function run(cmd, args, opts = {}) {
+            return execFileSync(cmd, args, { stdio: ["ignore", "pipe", "pipe"], ...opts }).toString();
+          }
+
+          function findAll(root, predicate, out = []) {
+            for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+              const p = path.join(root, entry.name);
+              if (predicate(entry, p)) out.push(p);
+              if (entry.isDirectory()) findAll(p, predicate, out);
+            }
+            return out;
+          }
+
+          exports.default = async function afterSign(context) {
+            if (context.electronPlatformName !== "darwin") return;
+            if (process.env.SKIP_NOTARIZE === "1") return;
+
+            const packager = context.packager;
+            const appName = packager.appInfo.productFilename;
+            const appPath = path.join(context.appOutDir, `${appName}.app`);
+            const macCfg = packager.config.mac || {};
+            const identity = process.env.CSC_NAME || macCfg.identity;
+            const entitlements = macCfg.entitlements
+              ? path.resolve(packager.projectDir, macCfg.entitlements)
+              : null;
+            if (!identity) throw new Error("[notarize] no signing identity (build.mac.identity or CSC_NAME)");
+
+            // Use the same temporary keychain electron-builder imported the cert into.
+            let keychainArgs = [];
+            try {
+              const info = await packager.codeSigningInfo.value;
+              if (info && info.keychainFile) keychainArgs = ["--keychain", info.keychainFile];
+            } catch (_) {
+              /* fall back to the default keychain search list */
+            }
+
+            const sign = (target) =>
+              run("codesign", [
+                "--force", "--sign", identity, "--options", "runtime", "--timestamp",
+                ...keychainArgs,
+                ...(entitlements ? ["--entitlements", entitlements] : []),
+                target,
+              ]);
+
+            const browsers = path.join(appPath, "Contents", "Resources", "playwright-browsers");
+
+            // 1. Remove AppleDouble-named files that ditto would strip from the zip.
+            const dotUnderscore = fs.existsSync(browsers)
+              ? findAll(browsers, (e) => e.isFile() && e.name.startsWith("._"))
+              : [];
+            for (const f of dotUnderscore) fs.unlinkSync(f);
+            console.log(`[notarize] removed ${dotUnderscore.length} '._*' file(s) from playwright-browsers`);
+
+            // 2. Re-sign WebKit frameworks inside-out: nested .xpc/.app/.dylib first, then the framework.
+            const frameworks = fs.existsSync(browsers)
+              ? findAll(browsers, (e, p) => e.isDirectory() && e.name.endsWith(".framework") && /\/webkit-[^/]+\//.test(p))
+              : [];
+            for (const fw of frameworks) {
+              const nested = findAll(
+                fw,
+                (e, p) => (e.isDirectory() && /\.(xpc|app)$/.test(e.name)) || (e.isFile() && e.name.endsWith(".dylib"))
+              ).sort((a, b) => b.length - a.length); // deepest first
+              for (const n of nested) sign(n);
+              sign(fw);
+              console.log(`[notarize] re-signed ${path.relative(appPath, fw)} (${nested.length} nested)`);
+            }
+
+            // 3. Re-seal the outer app (its resource list changed in steps 1–2). No --deep.
+            sign(appPath);
+            console.log("[notarize] re-signed app bundle");
+
+            // 4. Strip extended attributes so the notary zip has no __MACOSX sidecars.
+            run("xattr", ["-cr", appPath]);
+
+            // 5. Verify, then verify again after a ditto round-trip (what the notary receives).
+            run("codesign", ["--verify", "--deep", "--verbose=2", appPath]);
+            const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "notarize-rt-"));
+            const zip = path.join(tmp, "rt.zip");
+            run("ditto", ["-c", "-k", "--sequesterRsrc", "--keepParent", appPath, zip]);
+            const sidecars = run("unzip", ["-l", zip]).split("\n").filter((l) => /__MACOSX|\/\._/.test(l)).length;
+            console.log(`[notarize] round-trip zip sidecar entries: ${sidecars}`);
+            run("ditto", ["-x", "-k", zip, tmp]);
+            const rt = path.join(tmp, `${appName}.app`);
+            run("codesign", ["--verify", "--deep", "--verbose=2", rt]);
+            run("codesign", ["--verify", "--verbose=2", path.join(rt, "Contents", "MacOS", appName)]);
+            fs.rmSync(tmp, { recursive: true, force: true });
+            console.log("[notarize] signature OK after round-trip; submitting to Apple");
+
+            // 6. Notarize + staple.
+            await notarize({
+              appPath,
+              appleId: process.env.APPLE_ID,
+              appleIdPassword: process.env.APPLE_APP_SPECIFIC_PASSWORD,
+              teamId: process.env.APPLE_TEAM_ID,
+            });
+            console.log("[notarize] done");
+          };
+          NOTARIZE_EOF
+
       - name: Build + package (signed + notarized)
         working-directory: src
         env:
@@ -156,7 +284,7 @@ jobs:
           # does not hit EMFILE while signing/copying them.
           sudo launchctl limit maxfiles 65536 200000
           ulimit -n 65536
-          npm run build:dmg-arm64:ci
+          npm run build:dmg-arm64:ci -- --config.mac.notarize=false --config.afterSign=build/notarize.js
 
       - name: Diagnose signature
         if: failure()
@@ -253,6 +381,134 @@ jobs:
         working-directory: src
         run: npm install
 
+      - name: Write notarize hook (repairs Playwright WebKit signing, then notarizes)
+        working-directory: src
+        run: |
+          mkdir -p build
+          cat > build/notarize.js <<'NOTARIZE_EOF'
+          // build/notarize.js — electron-builder afterSign hook.
+          //
+          // Repairs two defects in the bundled Playwright WebKit that make Apple's
+          // notary reject the app on current macOS toolchains (confirmed via
+          // `codesign --verify --strict` on the built app):
+          //
+          //   1. Playwright ships a real file named `._metadata.json` inside
+          //      WebKit.framework. electron-builder seals it into the app; `ditto` then
+          //      treats it as an AppleDouble sidecar and drops it from the zip, so the
+          //      main executable's resource seal fails at Apple.
+          //   2. electron-builder signs WebKit.framework before the XPC services inside
+          //      it, so the framework's seal is invalid ("file modified ... .xpc").
+          //
+          // Fix: delete `._*` files, re-sign the WebKit frameworks inside-out (XPC
+          // services first), re-sign the outer app (no --deep) so its seal is fresh,
+          // strip extended attributes, verify through a ditto round-trip, then notarize.
+          // Requires `"notarize": false` under build.mac and
+          // `"afterSign": "build/notarize.js"` under build.
+          const { execFileSync } = require("child_process");
+          const fs = require("fs");
+          const os = require("os");
+          const path = require("path");
+          const { notarize } = require("@electron/notarize");
+
+          function run(cmd, args, opts = {}) {
+            return execFileSync(cmd, args, { stdio: ["ignore", "pipe", "pipe"], ...opts }).toString();
+          }
+
+          function findAll(root, predicate, out = []) {
+            for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+              const p = path.join(root, entry.name);
+              if (predicate(entry, p)) out.push(p);
+              if (entry.isDirectory()) findAll(p, predicate, out);
+            }
+            return out;
+          }
+
+          exports.default = async function afterSign(context) {
+            if (context.electronPlatformName !== "darwin") return;
+            if (process.env.SKIP_NOTARIZE === "1") return;
+
+            const packager = context.packager;
+            const appName = packager.appInfo.productFilename;
+            const appPath = path.join(context.appOutDir, `${appName}.app`);
+            const macCfg = packager.config.mac || {};
+            const identity = process.env.CSC_NAME || macCfg.identity;
+            const entitlements = macCfg.entitlements
+              ? path.resolve(packager.projectDir, macCfg.entitlements)
+              : null;
+            if (!identity) throw new Error("[notarize] no signing identity (build.mac.identity or CSC_NAME)");
+
+            // Use the same temporary keychain electron-builder imported the cert into.
+            let keychainArgs = [];
+            try {
+              const info = await packager.codeSigningInfo.value;
+              if (info && info.keychainFile) keychainArgs = ["--keychain", info.keychainFile];
+            } catch (_) {
+              /* fall back to the default keychain search list */
+            }
+
+            const sign = (target) =>
+              run("codesign", [
+                "--force", "--sign", identity, "--options", "runtime", "--timestamp",
+                ...keychainArgs,
+                ...(entitlements ? ["--entitlements", entitlements] : []),
+                target,
+              ]);
+
+            const browsers = path.join(appPath, "Contents", "Resources", "playwright-browsers");
+
+            // 1. Remove AppleDouble-named files that ditto would strip from the zip.
+            const dotUnderscore = fs.existsSync(browsers)
+              ? findAll(browsers, (e) => e.isFile() && e.name.startsWith("._"))
+              : [];
+            for (const f of dotUnderscore) fs.unlinkSync(f);
+            console.log(`[notarize] removed ${dotUnderscore.length} '._*' file(s) from playwright-browsers`);
+
+            // 2. Re-sign WebKit frameworks inside-out: nested .xpc/.app/.dylib first, then the framework.
+            const frameworks = fs.existsSync(browsers)
+              ? findAll(browsers, (e, p) => e.isDirectory() && e.name.endsWith(".framework") && /\/webkit-[^/]+\//.test(p))
+              : [];
+            for (const fw of frameworks) {
+              const nested = findAll(
+                fw,
+                (e, p) => (e.isDirectory() && /\.(xpc|app)$/.test(e.name)) || (e.isFile() && e.name.endsWith(".dylib"))
+              ).sort((a, b) => b.length - a.length); // deepest first
+              for (const n of nested) sign(n);
+              sign(fw);
+              console.log(`[notarize] re-signed ${path.relative(appPath, fw)} (${nested.length} nested)`);
+            }
+
+            // 3. Re-seal the outer app (its resource list changed in steps 1–2). No --deep.
+            sign(appPath);
+            console.log("[notarize] re-signed app bundle");
+
+            // 4. Strip extended attributes so the notary zip has no __MACOSX sidecars.
+            run("xattr", ["-cr", appPath]);
+
+            // 5. Verify, then verify again after a ditto round-trip (what the notary receives).
+            run("codesign", ["--verify", "--deep", "--verbose=2", appPath]);
+            const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "notarize-rt-"));
+            const zip = path.join(tmp, "rt.zip");
+            run("ditto", ["-c", "-k", "--sequesterRsrc", "--keepParent", appPath, zip]);
+            const sidecars = run("unzip", ["-l", zip]).split("\n").filter((l) => /__MACOSX|\/\._/.test(l)).length;
+            console.log(`[notarize] round-trip zip sidecar entries: ${sidecars}`);
+            run("ditto", ["-x", "-k", zip, tmp]);
+            const rt = path.join(tmp, `${appName}.app`);
+            run("codesign", ["--verify", "--deep", "--verbose=2", rt]);
+            run("codesign", ["--verify", "--verbose=2", path.join(rt, "Contents", "MacOS", appName)]);
+            fs.rmSync(tmp, { recursive: true, force: true });
+            console.log("[notarize] signature OK after round-trip; submitting to Apple");
+
+            // 6. Notarize + staple.
+            await notarize({
+              appPath,
+              appleId: process.env.APPLE_ID,
+              appleIdPassword: process.env.APPLE_APP_SPECIFIC_PASSWORD,
+              teamId: process.env.APPLE_TEAM_ID,
+            });
+            console.log("[notarize] done");
+          };
+          NOTARIZE_EOF
+
       - name: Build + package (signed + notarized)
         working-directory: src
         env:
@@ -269,7 +525,7 @@ jobs:
           # does not hit EMFILE while signing/copying them.
           sudo launchctl limit maxfiles 65536 200000
           ulimit -n 65536
-          npm run build:dmg-x64:ci
+          npm run build:dmg-x64:ci -- --config.mac.notarize=false --config.afterSign=build/notarize.js
 
       - name: Diagnose signature
         if: failure()
