@@ -14,7 +14,7 @@ name: Release
 #
 # Jobs run in parallel after create-release:
 #   windows      -> windows-latest  (NSIS installer + zip, signed)
-#   macos-arm64  -> macos-15        (Apple Silicon, native)  DMG + zip, signed + notarized
+#   macos-arm64  -> macos-26        (Apple Silicon, native)  DMG + zip, signed + notarized
 #   macos-x64    -> macos-15-intel  (Intel, native)          DMG + zip, signed + notarized
 # ---------------------------------------------------------------------------
 
@@ -107,7 +107,7 @@ jobs:
 
   macos-arm64:
     needs: create-release
-    runs-on: macos-15        # Apple Silicon — native arm64 build (macos-14 retired Nov 2, 2026)
+    runs-on: macos-26        # Apple Silicon — native arm64 build (macos-14 retired Nov 2, 2026)
     steps:
       - name: Clone source from GitLab at tag
         env:
@@ -132,7 +132,7 @@ jobs:
         with:
           path: src/playwright-browsers/macarm64
           # Image name in the key so browsers cached on macos-14 are not reused
-          key: pw-macarm64-macos15-${{ hashFiles('src/package.json') }}
+          key: pw-macarm64-macos26-${{ hashFiles('src/package.json') }}
 
       - name: Install dependencies
         working-directory: src
