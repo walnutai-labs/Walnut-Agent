@@ -107,7 +107,7 @@ jobs:
 
   macos-arm64:
     needs: create-release
-    runs-on: macos-14        # Apple Silicon — native arm64 build
+    runs-on: macos-15        # Apple Silicon — native arm64 build
     steps:
       - name: Clone source from GitLab at tag
         env:
