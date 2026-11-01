@@ -142,8 +142,8 @@ jobs:
         working-directory: src
         run: |
           mkdir -p build
-          cat > build/notarize.js <<'NOTARIZE_EOF'
-          // build/notarize.js — electron-builder afterSign hook.
+          cat > build/notarize.cjs <<'NOTARIZE_EOF'
+          // build/notarize.cjs — electron-builder afterSign hook.
           //
           // Repairs two defects in the bundled Playwright WebKit that make Apple's
           // notary reject the app on current macOS toolchains (confirmed via
@@ -160,7 +160,7 @@ jobs:
           // services first), re-sign the outer app (no --deep) so its seal is fresh,
           // strip extended attributes, verify through a ditto round-trip, then notarize.
           // Requires `"notarize": false` under build.mac and
-          // `"afterSign": "build/notarize.js"` under build.
+          // `"afterSign": "build/notarize.cjs"` under build.
           const { execFileSync } = require("child_process");
           const fs = require("fs");
           const os = require("os");
@@ -284,7 +284,7 @@ jobs:
           # does not hit EMFILE while signing/copying them.
           sudo launchctl limit maxfiles 65536 200000
           ulimit -n 65536
-          npm run build:dmg-arm64:ci -- --config.mac.notarize=false --config.afterSign=build/notarize.js
+          npm run build:dmg-arm64:ci -- --config.mac.notarize=false --config.afterSign=build/notarize.cjs
 
       - name: Diagnose signature
         if: failure()
@@ -385,8 +385,8 @@ jobs:
         working-directory: src
         run: |
           mkdir -p build
-          cat > build/notarize.js <<'NOTARIZE_EOF'
-          // build/notarize.js — electron-builder afterSign hook.
+          cat > build/notarize.cjs <<'NOTARIZE_EOF'
+          // build/notarize.cjs — electron-builder afterSign hook.
           //
           // Repairs two defects in the bundled Playwright WebKit that make Apple's
           // notary reject the app on current macOS toolchains (confirmed via
@@ -403,7 +403,7 @@ jobs:
           // services first), re-sign the outer app (no --deep) so its seal is fresh,
           // strip extended attributes, verify through a ditto round-trip, then notarize.
           // Requires `"notarize": false` under build.mac and
-          // `"afterSign": "build/notarize.js"` under build.
+          // `"afterSign": "build/notarize.cjs"` under build.
           const { execFileSync } = require("child_process");
           const fs = require("fs");
           const os = require("os");
@@ -525,7 +525,7 @@ jobs:
           # does not hit EMFILE while signing/copying them.
           sudo launchctl limit maxfiles 65536 200000
           ulimit -n 65536
-          npm run build:dmg-x64:ci -- --config.mac.notarize=false --config.afterSign=build/notarize.js
+          npm run build:dmg-x64:ci -- --config.mac.notarize=false --config.afterSign=build/notarize.cjs
 
       - name: Diagnose signature
         if: failure()
