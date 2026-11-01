@@ -145,32 +145,35 @@ jobs:
           cat > build/notarize.cjs <<'NOTARIZE_EOF'
           // build/notarize.cjs — electron-builder afterSign hook.
           //
-          // Repairs two defects in the bundled Playwright WebKit that make Apple's
-          // notary reject the app on current macOS toolchains (confirmed via
-          // `codesign --verify --strict` on the built app):
+          // Repairs defects in the bundled Playwright WebKit that make Apple's notary
+          // reject the app on current macOS toolchains (confirmed via codesign --verify
+          // --strict on the built app):
           //
           //   1. Playwright ships a real file named `._metadata.json` inside
-          //      WebKit.framework. electron-builder seals it into the app; `ditto` then
-          //      treats it as an AppleDouble sidecar and drops it from the zip, so the
-          //      main executable's resource seal fails at Apple.
-          //   2. electron-builder signs WebKit.framework before the XPC services inside
-          //      it, so the framework's seal is invalid ("file modified ... .xpc").
+          //      WebKit.framework. ditto treats it as an AppleDouble sidecar and drops it
+          //      from the notary zip, so the main executable's resource seal fails.
+          //   2. WebKit.framework's XPCServices/*.xpc are symlinks to bundles that live
+          //      outside the framework. codesign cannot seal nested code reached through
+          //      a symlink that leaves the bundle, so the framework's seal is invalid.
           //
-          // Fix: delete `._*` files, re-sign the WebKit frameworks inside-out (XPC
-          // services first), re-sign the outer app (no --deep) so its seal is fresh,
-          // strip extended attributes, verify through a ditto round-trip, then notarize.
-          // Requires `"notarize": false` under build.mac and
-          // `"afterSign": "build/notarize.cjs"` under build.
+          // Fix: delete `._*` files; replace symlinks that escape a framework with real
+          // copies; re-sign the WebKit frameworks inside-out (nested .xpc/.app/.dylib
+          // first); re-sign the outer app (no --deep) so its seal is fresh; strip xattrs;
+          // verify each framework strictly and the app through a ditto round-trip; then
+          // notarize. Requires `"notarize": false` under build.mac and
+          // `"afterSign": "build/notarize.cjs"` under build (or the equivalent --config flags).
           const { execFileSync } = require("child_process");
           const fs = require("fs");
           const os = require("os");
           const path = require("path");
           const { notarize } = require("@electron/notarize");
 
+          const BIG = 512 * 1024 * 1024;
           function run(cmd, args, opts = {}) {
-            return execFileSync(cmd, args, { stdio: ["ignore", "pipe", "pipe"], ...opts }).toString();
+            return execFileSync(cmd, args, { stdio: ["ignore", "pipe", "pipe"], maxBuffer: BIG, ...opts }).toString();
           }
 
+          // Walk a tree without following symlinks. predicate(dirent, fullPath).
           function findAll(root, predicate, out = []) {
             for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
               const p = path.join(root, entry.name);
@@ -178,6 +181,28 @@ jobs:
               if (entry.isDirectory()) findAll(p, predicate, out);
             }
             return out;
+          }
+
+          // Replace any symlink inside `bundle` whose real target lies outside `bundle`
+          // with a real copy of the target. Returns the number replaced.
+          function materializeEscapingSymlinks(bundle) {
+            const bundleReal = fs.realpathSync(bundle) + path.sep;
+            const links = findAll(bundle, (e) => e.isSymbolicLink());
+            let n = 0;
+            for (const link of links) {
+              let target;
+              try {
+                target = fs.realpathSync(link);
+              } catch {
+                continue; // dangling; leave it (prune script already removes most of these)
+              }
+              if (target.startsWith(bundleReal)) continue; // stays inside the bundle: fine
+              fs.unlinkSync(link);
+              fs.cpSync(target, link, { recursive: true, verbatimSymlinks: true });
+              console.log(`[notarize]   materialized ${path.relative(bundle, link)} -> ${target}`);
+              n++;
+            }
+            return n;
           }
 
           exports.default = async function afterSign(context) {
@@ -189,9 +214,7 @@ jobs:
             const appPath = path.join(context.appOutDir, `${appName}.app`);
             const macCfg = packager.config.mac || {};
             const identity = process.env.CSC_NAME || macCfg.identity;
-            const entitlements = macCfg.entitlements
-              ? path.resolve(packager.projectDir, macCfg.entitlements)
-              : null;
+            const entitlements = macCfg.entitlements ? path.resolve(packager.projectDir, macCfg.entitlements) : null;
             if (!identity) throw new Error("[notarize] no signing identity (build.mac.identity or CSC_NAME)");
 
             // Use the same temporary keychain electron-builder imported the cert into.
@@ -199,7 +222,7 @@ jobs:
             try {
               const info = await packager.codeSigningInfo.value;
               if (info && info.keychainFile) keychainArgs = ["--keychain", info.keychainFile];
-            } catch (_) {
+            } catch {
               /* fall back to the default keychain search list */
             }
 
@@ -212,26 +235,29 @@ jobs:
               ]);
 
             const browsers = path.join(appPath, "Contents", "Resources", "playwright-browsers");
+            const hasBrowsers = fs.existsSync(browsers);
 
             // 1. Remove AppleDouble-named files that ditto would strip from the zip.
-            const dotUnderscore = fs.existsSync(browsers)
-              ? findAll(browsers, (e) => e.isFile() && e.name.startsWith("._"))
-              : [];
+            const dotUnderscore = hasBrowsers ? findAll(browsers, (e) => e.isFile() && e.name.startsWith("._")) : [];
             for (const f of dotUnderscore) fs.unlinkSync(f);
             console.log(`[notarize] removed ${dotUnderscore.length} '._*' file(s) from playwright-browsers`);
 
-            // 2. Re-sign WebKit frameworks inside-out: nested .xpc/.app/.dylib first, then the framework.
-            const frameworks = fs.existsSync(browsers)
+            // 2. WebKit frameworks: make them self-contained, then sign inside-out.
+            const frameworks = hasBrowsers
               ? findAll(browsers, (e, p) => e.isDirectory() && e.name.endsWith(".framework") && /\/webkit-[^/]+\//.test(p))
               : [];
             for (const fw of frameworks) {
+              const materialized = materializeEscapingSymlinks(fw);
               const nested = findAll(
                 fw,
-                (e, p) => (e.isDirectory() && /\.(xpc|app)$/.test(e.name)) || (e.isFile() && e.name.endsWith(".dylib"))
+                (e) => (e.isDirectory() && /\.(xpc|app)$/.test(e.name)) || (e.isFile() && e.name.endsWith(".dylib"))
               ).sort((a, b) => b.length - a.length); // deepest first
               for (const n of nested) sign(n);
               sign(fw);
-              console.log(`[notarize] re-signed ${path.relative(appPath, fw)} (${nested.length} nested)`);
+              console.log(
+                `[notarize] re-signed ${path.relative(appPath, fw)} (${materialized} symlink(s) materialized, ${nested.length} nested signed)`
+              );
+              run("codesign", ["--verify", "--strict", "--verbose=2", fw]); // throws if still broken
             }
 
             // 3. Re-seal the outer app (its resource list changed in steps 1–2). No --deep.
@@ -246,14 +272,17 @@ jobs:
             const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "notarize-rt-"));
             const zip = path.join(tmp, "rt.zip");
             run("ditto", ["-c", "-k", "--sequesterRsrc", "--keepParent", appPath, zip]);
-            const sidecars = run("unzip", ["-l", zip]).split("\n").filter((l) => /__MACOSX|\/\._/.test(l)).length;
+            const sidecars = run("unzip", ["-Z1", zip]).split("\n").filter((l) => /__MACOSX|\/\._/.test(l)).length;
             console.log(`[notarize] round-trip zip sidecar entries: ${sidecars}`);
             run("ditto", ["-x", "-k", zip, tmp]);
             const rt = path.join(tmp, `${appName}.app`);
             run("codesign", ["--verify", "--deep", "--verbose=2", rt]);
             run("codesign", ["--verify", "--verbose=2", path.join(rt, "Contents", "MacOS", appName)]);
+            for (const fw of frameworks) {
+              run("codesign", ["--verify", "--strict", "--verbose=2", path.join(rt, path.relative(appPath, fw))]);
+            }
             fs.rmSync(tmp, { recursive: true, force: true });
-            console.log("[notarize] signature OK after round-trip; submitting to Apple");
+            console.log("[notarize] signatures OK after round-trip; submitting to Apple");
 
             // 6. Notarize + staple.
             await notarize({
@@ -388,32 +417,35 @@ jobs:
           cat > build/notarize.cjs <<'NOTARIZE_EOF'
           // build/notarize.cjs — electron-builder afterSign hook.
           //
-          // Repairs two defects in the bundled Playwright WebKit that make Apple's
-          // notary reject the app on current macOS toolchains (confirmed via
-          // `codesign --verify --strict` on the built app):
+          // Repairs defects in the bundled Playwright WebKit that make Apple's notary
+          // reject the app on current macOS toolchains (confirmed via codesign --verify
+          // --strict on the built app):
           //
           //   1. Playwright ships a real file named `._metadata.json` inside
-          //      WebKit.framework. electron-builder seals it into the app; `ditto` then
-          //      treats it as an AppleDouble sidecar and drops it from the zip, so the
-          //      main executable's resource seal fails at Apple.
-          //   2. electron-builder signs WebKit.framework before the XPC services inside
-          //      it, so the framework's seal is invalid ("file modified ... .xpc").
+          //      WebKit.framework. ditto treats it as an AppleDouble sidecar and drops it
+          //      from the notary zip, so the main executable's resource seal fails.
+          //   2. WebKit.framework's XPCServices/*.xpc are symlinks to bundles that live
+          //      outside the framework. codesign cannot seal nested code reached through
+          //      a symlink that leaves the bundle, so the framework's seal is invalid.
           //
-          // Fix: delete `._*` files, re-sign the WebKit frameworks inside-out (XPC
-          // services first), re-sign the outer app (no --deep) so its seal is fresh,
-          // strip extended attributes, verify through a ditto round-trip, then notarize.
-          // Requires `"notarize": false` under build.mac and
-          // `"afterSign": "build/notarize.cjs"` under build.
+          // Fix: delete `._*` files; replace symlinks that escape a framework with real
+          // copies; re-sign the WebKit frameworks inside-out (nested .xpc/.app/.dylib
+          // first); re-sign the outer app (no --deep) so its seal is fresh; strip xattrs;
+          // verify each framework strictly and the app through a ditto round-trip; then
+          // notarize. Requires `"notarize": false` under build.mac and
+          // `"afterSign": "build/notarize.cjs"` under build (or the equivalent --config flags).
           const { execFileSync } = require("child_process");
           const fs = require("fs");
           const os = require("os");
           const path = require("path");
           const { notarize } = require("@electron/notarize");
 
+          const BIG = 512 * 1024 * 1024;
           function run(cmd, args, opts = {}) {
-            return execFileSync(cmd, args, { stdio: ["ignore", "pipe", "pipe"], ...opts }).toString();
+            return execFileSync(cmd, args, { stdio: ["ignore", "pipe", "pipe"], maxBuffer: BIG, ...opts }).toString();
           }
 
+          // Walk a tree without following symlinks. predicate(dirent, fullPath).
           function findAll(root, predicate, out = []) {
             for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
               const p = path.join(root, entry.name);
@@ -421,6 +453,28 @@ jobs:
               if (entry.isDirectory()) findAll(p, predicate, out);
             }
             return out;
+          }
+
+          // Replace any symlink inside `bundle` whose real target lies outside `bundle`
+          // with a real copy of the target. Returns the number replaced.
+          function materializeEscapingSymlinks(bundle) {
+            const bundleReal = fs.realpathSync(bundle) + path.sep;
+            const links = findAll(bundle, (e) => e.isSymbolicLink());
+            let n = 0;
+            for (const link of links) {
+              let target;
+              try {
+                target = fs.realpathSync(link);
+              } catch {
+                continue; // dangling; leave it (prune script already removes most of these)
+              }
+              if (target.startsWith(bundleReal)) continue; // stays inside the bundle: fine
+              fs.unlinkSync(link);
+              fs.cpSync(target, link, { recursive: true, verbatimSymlinks: true });
+              console.log(`[notarize]   materialized ${path.relative(bundle, link)} -> ${target}`);
+              n++;
+            }
+            return n;
           }
 
           exports.default = async function afterSign(context) {
@@ -432,9 +486,7 @@ jobs:
             const appPath = path.join(context.appOutDir, `${appName}.app`);
             const macCfg = packager.config.mac || {};
             const identity = process.env.CSC_NAME || macCfg.identity;
-            const entitlements = macCfg.entitlements
-              ? path.resolve(packager.projectDir, macCfg.entitlements)
-              : null;
+            const entitlements = macCfg.entitlements ? path.resolve(packager.projectDir, macCfg.entitlements) : null;
             if (!identity) throw new Error("[notarize] no signing identity (build.mac.identity or CSC_NAME)");
 
             // Use the same temporary keychain electron-builder imported the cert into.
@@ -442,7 +494,7 @@ jobs:
             try {
               const info = await packager.codeSigningInfo.value;
               if (info && info.keychainFile) keychainArgs = ["--keychain", info.keychainFile];
-            } catch (_) {
+            } catch {
               /* fall back to the default keychain search list */
             }
 
@@ -455,26 +507,29 @@ jobs:
               ]);
 
             const browsers = path.join(appPath, "Contents", "Resources", "playwright-browsers");
+            const hasBrowsers = fs.existsSync(browsers);
 
             // 1. Remove AppleDouble-named files that ditto would strip from the zip.
-            const dotUnderscore = fs.existsSync(browsers)
-              ? findAll(browsers, (e) => e.isFile() && e.name.startsWith("._"))
-              : [];
+            const dotUnderscore = hasBrowsers ? findAll(browsers, (e) => e.isFile() && e.name.startsWith("._")) : [];
             for (const f of dotUnderscore) fs.unlinkSync(f);
             console.log(`[notarize] removed ${dotUnderscore.length} '._*' file(s) from playwright-browsers`);
 
-            // 2. Re-sign WebKit frameworks inside-out: nested .xpc/.app/.dylib first, then the framework.
-            const frameworks = fs.existsSync(browsers)
+            // 2. WebKit frameworks: make them self-contained, then sign inside-out.
+            const frameworks = hasBrowsers
               ? findAll(browsers, (e, p) => e.isDirectory() && e.name.endsWith(".framework") && /\/webkit-[^/]+\//.test(p))
               : [];
             for (const fw of frameworks) {
+              const materialized = materializeEscapingSymlinks(fw);
               const nested = findAll(
                 fw,
-                (e, p) => (e.isDirectory() && /\.(xpc|app)$/.test(e.name)) || (e.isFile() && e.name.endsWith(".dylib"))
+                (e) => (e.isDirectory() && /\.(xpc|app)$/.test(e.name)) || (e.isFile() && e.name.endsWith(".dylib"))
               ).sort((a, b) => b.length - a.length); // deepest first
               for (const n of nested) sign(n);
               sign(fw);
-              console.log(`[notarize] re-signed ${path.relative(appPath, fw)} (${nested.length} nested)`);
+              console.log(
+                `[notarize] re-signed ${path.relative(appPath, fw)} (${materialized} symlink(s) materialized, ${nested.length} nested signed)`
+              );
+              run("codesign", ["--verify", "--strict", "--verbose=2", fw]); // throws if still broken
             }
 
             // 3. Re-seal the outer app (its resource list changed in steps 1–2). No --deep.
@@ -489,14 +544,17 @@ jobs:
             const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "notarize-rt-"));
             const zip = path.join(tmp, "rt.zip");
             run("ditto", ["-c", "-k", "--sequesterRsrc", "--keepParent", appPath, zip]);
-            const sidecars = run("unzip", ["-l", zip]).split("\n").filter((l) => /__MACOSX|\/\._/.test(l)).length;
+            const sidecars = run("unzip", ["-Z1", zip]).split("\n").filter((l) => /__MACOSX|\/\._/.test(l)).length;
             console.log(`[notarize] round-trip zip sidecar entries: ${sidecars}`);
             run("ditto", ["-x", "-k", zip, tmp]);
             const rt = path.join(tmp, `${appName}.app`);
             run("codesign", ["--verify", "--deep", "--verbose=2", rt]);
             run("codesign", ["--verify", "--verbose=2", path.join(rt, "Contents", "MacOS", appName)]);
+            for (const fw of frameworks) {
+              run("codesign", ["--verify", "--strict", "--verbose=2", path.join(rt, path.relative(appPath, fw))]);
+            }
             fs.rmSync(tmp, { recursive: true, force: true });
-            console.log("[notarize] signature OK after round-trip; submitting to Apple");
+            console.log("[notarize] signatures OK after round-trip; submitting to Apple");
 
             // 6. Notarize + staple.
             await notarize({
